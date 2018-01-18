@@ -226,8 +226,8 @@ def deploy_job(script,
                credentials,
                name,
                logger,
-               avoid_cleanup):  # pylint: disable=W0613
-    """ Exec a eployment job script that receives SSH credentials as input """
+               avoid_cleanup):
+    """ Exec a deployment job script that receives SSH credentials as input """
 
     # Build the execution call
     script_data = ctx.get_resource(script).replace("$", "\\$")

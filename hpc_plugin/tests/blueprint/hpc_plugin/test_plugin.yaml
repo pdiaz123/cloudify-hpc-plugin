@@ -93,11 +93,65 @@ node_types:
                         simulate:
                             default: { get_property: [SELF, simulate] }
 
+    hpc.nodes.bash_job:
+        derived_from: cloudify.nodes.Root
+        properties:
+            deployment:
+                description: Deployment scripts and inputs
+                default: {}
+            script:
+                description: relative path to the bash script
+                default: ""
+                type: string
+            inputs:
+                description: list of inputs received by the script
+                default: []
+            avoid_cleanup:
+                description: True to not clean after execution (debug purposes)
+                type: boolean
+                default: False
+        interfaces:
+            cloudify.interfaces.lifecycle:
+                start:
+                    implementation: hpc.hpc_plugin.tasks.bootstrap_job
+                    inputs:
+                        deployment:
+                            description: Deployment script and inputs
+                            default: { get_property: [SELF, deployment] }
+                        avoid:
+                            default: { get_property: [SELF, avoid_cleanup] }
+                stop:
+                    implementation: hpc.hpc_plugin.tasks.revert_job
+                    inputs:
+                        deployment:
+                            description: Undeployment script and inputs
+                            default: { get_property: [SELF, deployment] }
+                        avoid:
+                            default: { get_property: [SELF, avoid_cleanup] }
+            hpc.interfaces.lifecycle:
+                queue:
+                    implementation: hpc.hpc_plugin.tasks.send_job
+                    inputs:
+                        job_options:
+                            default: { get_property: [SELF, job_options] }
+                cleanup:
+                    implementation: hpc.hpc_plugin.tasks.clean_job_aux_files
+                    inputs:
+                        job_options:
+                            default: { get_property: [SELF, job_options] }
+                        avoid:
+                            default: { get_property: [SELF, avoid_cleanup] }
+                cancel:
+                    implementation: hpc.hpc_plugin.tasks.stop_job
+                    inputs:
+                        job_options:
+                            default: { get_property: [SELF, job_options] }
+
     hpc.nodes.job:
         derived_from: cloudify.nodes.Root
         properties:
             deployment:
-                description: Deployment script and inputs
+                description: Deployment scripts and inputs
                 default: {}
             job_options:
                 description: Job main command and options
