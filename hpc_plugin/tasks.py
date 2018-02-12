@@ -19,29 +19,73 @@ from cloudify import ctx
 from cloudify.decorators import operation
 from cloudify.exceptions import NonRecoverableError
 
-from hpc_plugin.ssh import SshClient
-from hpc_plugin import slurm
+from ssh import SshClient
+from workload_managers.workload_manager import WorkloadManager
 
 
 @operation
-def login_connection(config, simulate, **kwargs):  # pylint: disable=W0613
+def prepare_hpc(config,
+                base_dir,
+                workdir_prefix,
+                simulate,
+                **kwargs):  # pylint: disable=W0613
     """ Tries to connect to a login node """
     ctx.logger.info('Connecting to login node..')
-    credentials = config['credentials']
     if not simulate:
+        wm_type = config['workload_manager']
+        wm = WorkloadManager.factory(wm_type)
+        credentials = config['credentials']
         client = SshClient(credentials['host'],
                            credentials['user'],
                            credentials['password'])
-        _, exit_code = client.send_command('uname', wait_result=True)
+        _, exit_code = wm._execute_shell_command(client,
+                                                 'uname',
+                                                 wait_result=True)
 
         if exit_code is not 0:
             raise NonRecoverableError(
                 "failed to connect to HPC: exit code " + str(exit_code))
 
         ctx.instance.runtime_properties['login'] = exit_code is 0
+
+        prefix = workdir_prefix
+        if workdir_prefix is "":
+            prefix = ctx.blueprint.id
+
+        workdir = wm.create_new_workdir(client, base_dir, prefix)
+        if workdir is None:
+            raise NonRecoverableError(
+                "failed to create the working directory, base dir: " +
+                base_dir)
+        ctx.instance.runtime_properties['workdir'] = workdir
+        ctx.logger.info('..HPC ready on ' + workdir)
     else:
         ctx.instance.runtime_properties['login'] = True
+        ctx.instance.runtime_properties['workdir'] = "simulation"
         ctx.logger.warning('HPC login connection simulated')
+
+
+@operation
+def cleanup_hpc(config, skip, simulate, **kwargs):  # pylint: disable=W0613
+    """ Tries to connect to a login node """
+    if skip:
+        return
+
+    ctx.logger.info('Cleaning up...')
+    if not simulate:
+        workdir = ctx.instance.runtime_properties['workdir']
+        wm_type = config['workload_manager']
+        wm = WorkloadManager.factory(wm_type)
+        credentials = config['credentials']
+        client = SshClient(credentials['host'],
+                           credentials['user'],
+                           credentials['password'])
+        _, exit_code = wm._execute_shell_command(client,
+                                                 'rm -r ' + workdir,
+                                                 wait_result=True)
+        ctx.logger.info('..all clean.')
+    else:
+        ctx.logger.warning('HPC clean up simulated.')
 
 
 @operation
@@ -70,6 +114,9 @@ def preconfigure_job(config,
         config['workload_manager']
     ctx.source.instance.runtime_properties['simulate'] = simulate
     ctx.source.instance.runtime_properties['job_prefix'] = job_prefix
+
+    ctx.source.instance.runtime_properties['workdir'] = \
+        ctx.target.instance.runtime_properties['workdir']
 
 
 @operation
@@ -161,7 +208,9 @@ def stop_monitoring_hpc(config,
 
 
 @operation
-def bootstrap_job(deployment, avoid, **kwarsgs):  # pylint: disable=W0613
+def bootstrap_job(deployment,
+                  skip_cleanup,
+                  **kwarsgs):  # pylint: disable=W0613
     """Bootstrap a job with a script that receives SSH credentials as imput"""
     if not deployment:
         return
@@ -172,15 +221,19 @@ def bootstrap_job(deployment, avoid, **kwarsgs):  # pylint: disable=W0613
     if not simulate and 'bootstrap' in deployment:
         inputs = deployment['inputs'] if 'inputs' in deployment else []
         credentials = ctx.instance.runtime_properties['credentials']
+        workdir = ctx.instance.runtime_properties['workdir']
         name = "bootstrap_" + ctx.instance.id + ".sh"
+        wm_type = ctx.instance.runtime_properties['workload_manager']
 
         is_bootstraped = deploy_job(
             deployment['bootstrap'],
             inputs,
             credentials,
+            wm_type,
+            workdir,
             name,
             ctx.logger,
-            avoid)
+            skip_cleanup)
     else:
         is_bootstraped = True
 
@@ -192,7 +245,7 @@ def bootstrap_job(deployment, avoid, **kwarsgs):  # pylint: disable=W0613
 
 
 @operation
-def revert_job(deployment, avoid, **kwarsgs):  # pylint: disable=W0613
+def revert_job(deployment, skip_cleanup, **kwarsgs):  # pylint: disable=W0613
     """Revert a job using a script that receives SSH credentials as input"""
     if not deployment:
         return
@@ -203,15 +256,19 @@ def revert_job(deployment, avoid, **kwarsgs):  # pylint: disable=W0613
     if not simulate and 'revert' in deployment:
         inputs = deployment['inputs'] if 'inputs' in deployment else []
         credentials = ctx.instance.runtime_properties['credentials']
+        workdir = ctx.instance.runtime_properties['workdir']
         name = "revert_" + ctx.instance.id + ".sh"
+        wm_type = ctx.instance.runtime_properties['workload_manager']
 
         is_reverted = deploy_job(
             deployment['revert'],
             inputs,
             credentials,
+            wm_type,
+            workdir,
             name,
             ctx.logger,
-            avoid)
+            skip_cleanup)
     else:
         is_reverted = True
 
@@ -224,38 +281,41 @@ def revert_job(deployment, avoid, **kwarsgs):  # pylint: disable=W0613
 def deploy_job(script,
                inputs,
                credentials,
+               wm_type,
+               workdir,
                name,
                logger,
-               avoid_cleanup):
-    """ Exec a deployment job script that receives SSH credentials as input """
+               skip_cleanup):  # pylint: disable=W0613
+    """ Exec a eployment job script that receives SSH credentials as input """
 
-    # Build the execution call
-    script_data = ctx.get_resource(script).replace("$", "\\$")
+    # TODO(emepetres): manage errors
+    wm = WorkloadManager.factory(wm_type)
 
-    # Execute and print output
+    # Execute the script and manage the output
     client = SshClient(credentials['host'],
                        credentials['user'],
                        credentials['password'])
-
-    create_call = "echo \"" + script_data + "\" >> " + name + \
-        "; chmod +x " + name
-    _, exit_code = client.send_command(create_call, wait_result=True)
-    if exit_code is not 0:
-        logger.error(
-            "failed to create deploy script: call '" + create_call +
-            "', exit code " + str(exit_code))
-    else:
+    if wm._create_shell_script(client,
+                               name,
+                               ctx.get_resource(script),
+                               logger,
+                               workdir=workdir):
         call = "./" + name
         for dinput in inputs:
             call += ' ' + dinput
-        _, exit_code = client.send_command(call, wait_result=True)
+        _, exit_code = wm._execute_shell_command(client,
+                                                 call,
+                                                 workdir=workdir,
+                                                 wait_result=True)
         if exit_code is not 0:
             logger.warning(
                 "failed to deploy job: call '" + call + "', exit code " +
                 str(exit_code))
 
-        if not avoid_cleanup:
-            if not client.send_command("rm " + name):
+        if not skip_cleanup:
+            if not wm._execute_shell_command(client,
+                                             "rm " + name,
+                                             workdir=workdir):
                 logger.warning("failed removing bootstrap script")
 
     client.close_connection()
@@ -274,17 +334,20 @@ def send_job(job_options, **kwargs):  # pylint: disable=W0613
         type_hierarchy
 
     if not simulate:
-
+        workdir = ctx.instance.runtime_properties['workdir']
+        wm_type = ctx.instance.runtime_properties['workload_manager']
         client = SshClient(credentials['host'],
                            credentials['user'],
                            credentials['password'])
 
-        # TODO(emepetres): use workload manager type
-        is_submitted = slurm.submit_job(client,
-                                        name,
-                                        job_options,
-                                        is_singularity,
-                                        ctx.logger)
+        # TODO(emepetres): manage errors
+        wm = WorkloadManager.factory(wm_type)
+        is_submitted = wm.submit_job(client,
+                                     name,
+                                     job_options,
+                                     is_singularity,
+                                     ctx.logger,
+                                     workdir=workdir)
         client.close_connection()
     else:
         ctx.logger.warning('Instance ' + ctx.instance.id + ' simulated')
@@ -302,9 +365,9 @@ def send_job(job_options, **kwargs):  # pylint: disable=W0613
 
 
 @operation
-def clean_job_aux_files(job_options, avoid, **kwargs):  # pylint: disable=W0613
+def cleanup_job(job_options, skip, **kwargs):  # pylint: disable=W0613
     """Clean the aux files of the job in the HPC"""
-    if avoid:
+    if skip:
         return
 
     simulate = ctx.instance.runtime_properties['simulate']
@@ -313,17 +376,21 @@ def clean_job_aux_files(job_options, avoid, **kwargs):  # pylint: disable=W0613
         is_singularity = 'hpc.nodes.singularity_job' in ctx.node.\
             type_hierarchy
         credentials = ctx.instance.runtime_properties['credentials']
+        workdir = ctx.instance.runtime_properties['workdir']
+        wm_type = ctx.instance.runtime_properties['workload_manager']
 
         client = SshClient(credentials['host'],
                            credentials['user'],
                            credentials['password'])
 
-        # TODO(emepetres): use workload manager type
-        is_clean = slurm.clean_job_aux_files(client,
-                                             name,
-                                             job_options,
-                                             is_singularity,
-                                             ctx.logger)
+        # TODO(emepetres): manage errors
+        wm = WorkloadManager.factory(wm_type)
+        is_clean = wm.clean_job_aux_files(client,
+                                          name,
+                                          job_options,
+                                          is_singularity,
+                                          ctx.logger,
+                                          workdir=workdir)
 
         client.close_connection()
     else:
@@ -348,16 +415,20 @@ def stop_job(job_options, **kwargs):  # pylint: disable=W0613
         type_hierarchy
 
     if not simulate:
+        workdir = ctx.instance.runtime_properties['workdir']
+        wm_type = ctx.instance.runtime_properties['workload_manager']
         client = SshClient(credentials['host'],
                            credentials['user'],
                            credentials['password'])
 
-        # TODO(emepetres): use workload manager type
-        is_stopped = slurm.stop_job(client,
-                                    name,
-                                    job_options,
-                                    is_singularity,
-                                    ctx.logger)
+        # TODO(emepetres): manage errors
+        wm = WorkloadManager.factory(wm_type)
+        is_stopped = wm.stop_job(client,
+                                 name,
+                                 job_options,
+                                 is_singularity,
+                                 ctx.logger,
+                                 workdir=workdir)
 
         client.close_connection()
     else:
