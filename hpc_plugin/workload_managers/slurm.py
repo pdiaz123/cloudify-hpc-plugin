@@ -37,7 +37,10 @@ class Slurm(WorkloadManager):
 
         # Slurm settings
         if 'partition' in job_settings:
-            script += '#SBATCH -p ' + job_settings['partition'] + '\n'
+            script += '#SBATCH -p ' + str(job_settings['partition']) + '\n'
+        
+        if 'qos' in job_settings:
+            script += '#SBATCH --qos ' + str(job_settings['qos']) + '\n'
 
         if 'nodes' in job_settings:
             script += '#SBATCH -N ' + str(job_settings['nodes']) + '\n'
@@ -110,7 +113,7 @@ class Slurm(WorkloadManager):
 
         # Slurm settings
         if 'partition' in job_settings:
-            slurm_call += ' -p ' + job_settings['partition']
+            slurm_call += ' -p ' + str(job_settings['partition'])
             
         if 'qos' in job_settings:
             slurm_call += ' --qos ' + str(job_settings['qos'])
