@@ -111,6 +111,9 @@ class Slurm(WorkloadManager):
         # Slurm settings
         if 'partition' in job_settings:
             slurm_call += ' -p ' + job_settings['partition']
+            
+        if 'qos' in job_settings:
+            slurm_call += ' --qos ' + str(job_settings['qos'])
 
         if 'nodes' in job_settings:
             slurm_call += ' -N ' + str(job_settings['nodes'])
